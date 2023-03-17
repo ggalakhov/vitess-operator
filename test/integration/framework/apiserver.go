@@ -26,11 +26,14 @@ import (
 	"os/exec"
 	"strconv"
 
+	"github.com/google/uuid"
 	"k8s.io/client-go/rest"
 	"k8s.io/klog"
 )
 
 var apiserverURL = ""
+var apiserverToken = ""
+var apiserverDataDir = ""
 
 const installApiserver = `
 Cannot find kube-apiserver, cannot run integration tests
@@ -60,22 +63,34 @@ func startApiserver() (func(), error) {
 	apiserverURL = fmt.Sprintf("http://127.0.0.1:%d", apiserverPort)
 	klog.Infof("starting kube-apiserver on %s", apiserverURL)
 
-	apiserverDataDir, err := ioutil.TempDir(os.TempDir(), "integration_test_apiserver_data")
+	apiserverDataDirLocal, err := ioutil.TempDir(os.TempDir(), "integration_test_apiserver_data")
 	if err != nil {
 		return nil, fmt.Errorf("unable to make temp kube-apiserver data dir: %v", err)
 	}
+	apiserverDataDir = apiserverDataDirLocal
 	klog.Infof("storing kube-apiserver data in: %v", apiserverDataDir)
+
+	apiserverToken = uuid.New().String()
+	os.WriteFile(fmt.Sprintf("%s/token.csv", apiserverDataDir), []byte(fmt.Sprintf("%s,integration,1", apiserverToken)), 0644)
+
+	abacRule1 := "{\"apiVersion\": \"abac.authorization.kubernetes.io/v1beta1\", \"kind\": \"Policy\", \"spec\": {\"user\": \"integration\", \"nonResourcePath\": \"*\"}}"
+	abacRule2 := "{\"apiVersion\": \"abac.authorization.kubernetes.io/v1beta1\", \"kind\": \"Policy\", \"spec\": {\"user\": \"integration\", \"namespace\": \"*\", \"resource\": \"*\", \"apiGroup\": \"*\"}}"
+
+	os.WriteFile(fmt.Sprintf("%s/abac", apiserverDataDir), []byte(fmt.Sprintf("%s\n%s", abacRule1, abacRule2)), 0644)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(
 		ctx,
 		apiserverPath,
 		"--cert-dir", apiserverDataDir,
-		"--insecure-port", strconv.Itoa(apiserverPort),
-		// We don't use the secure port, but we need to pick something that
-		// doesn't conflict with other test apiservers.
-		"--secure-port", strconv.Itoa(apiserverPort+1),
+		"--secure-port", strconv.Itoa(apiserverPort),
 		"--etcd-servers", etcdURL,
+		"--service-account-signing-key-file", fmt.Sprintf("%s/apiserver.key", apiserverDataDir),
+		"--service-account-key-file", fmt.Sprintf("%s/apiserver.key", apiserverDataDir),
+		"--service-account-issuer", "kube-apiserver",
+		"--authorization-mode", "ABAC",
+		"--authorization-policy-file", fmt.Sprintf("%s/abac", apiserverDataDir),
+		"--token-auth-file", fmt.Sprintf("%s/token.csv", apiserverDataDir),
 	)
 
 	// Uncomment these to see kube-apiserver output in test logs.
@@ -108,5 +123,17 @@ func ApiserverURL() string {
 func ApiserverConfig() *rest.Config {
 	return &rest.Config{
 		Host: ApiserverURL(),
+		BearerToken: apiserverToken,
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure: true,
+		},
 	}
+}
+
+func ApiserverToken() string {
+	return apiserverToken
+}
+
+func ApiserverCrt() string {
+	return fmt.Sprintf("%s/apiserver.crt", apiserverDataDir)
 }
